@@ -1,5 +1,6 @@
 using Flux
 using LinearAlgebra
+using DataStructures
 
 function mybatchedtranspose(x)
     # return PermutedDimsArray(x, (2, 1, 3))
@@ -21,6 +22,8 @@ function get_mask(shape, device)
         end
     end
 end
+
+attn_hisory = CircularBuffer{Any}(10)
 
 """
     attention(Q, K, V)
@@ -54,11 +57,13 @@ function attention(Q, K, V, masked)
         scores = mybatchedtranspose(K) ⊠ Q / Float32(sqrt(d_k)) # (seq_len_k, seq_len_q, batch_size...)
         scores = scores .+ mask
         attn = softmax(scores, dims=1) # (seq_len_k, seq_len_q, batch_size...)
+        Flux.Zygote.@ignore push!(attn_hisory, attn)
         ret_val = V ⊠ attn # (d_v, seq_len_q, batch_size...)
     else # non-batched. Can be implemented more efficiently by using standard matrix multiplication.
         scores = K' * Q / Float32(sqrt(d_k)) # (seq_len_k, seq_len_q)
         scores = scores .+ mask
         attn = softmax(scores, dims=1) # (seq_len_k, seq_len_q)
+        Flux.Zygote.@ignore push!(attn_hisory, attn)
         ret_val = V * attn # (d_v, seq_len_q)
     end
     return ret_val
