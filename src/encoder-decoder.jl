@@ -210,12 +210,13 @@ output = decoder_layer(x);            # size (512, seq_len, batch_size)
 ```
 ===
 """
-struct DecoderLayer
+mutable struct DecoderLayer
     attn1::ResidualAndNorm
     attn2::Union{ResidualAndNorm, Nothing} # if `no_encoder`, then this is set to nothing
     feedforward::ResidualAndNorm
+    cache
 end
-Flux.@functor DecoderLayer
+Flux.@functor DecoderLayer (attn1, attn2, feedforward)
 
 function DecoderLayer(dim::Int, dim_k::Int, dim_v::Int, num_heads::Int, dim_ff::Int; dropout=0.0, σ=gelu, no_encoder=false)
     attn1 = MultiHeadSelfAttention(dim, dim_k, dim_v, num_heads, dim, true)
@@ -228,7 +229,7 @@ function DecoderLayer(dim::Int, dim_k::Int, dim_v::Int, num_heads::Int, dim_ff::
     end
     feedforward = Chain(Dense(dim, dim_ff, σ), Dense(dim_ff, dim))
     feedforward = ResidualAndNorm(feedforward, dim; dropout=dropout)
-    return DecoderLayer(attn1, attn2, feedforward)
+    return DecoderLayer(attn1, attn2, feedforward, nothing)
 end
 
 """
@@ -239,10 +240,29 @@ end
 - `enc_out`: output of the encoder of shape (dim, seq_len_enc, batch_size)
 """
 function (layer::DecoderLayer)(x, enc_out)
-    x = layer.attn1(x, x) # self-attention, x is the query, key and value. output shape: (dim_v, seq_len_dec, batch_size)
-    x = layer.attn2(x, x, enc_out, enc_out) # encoder-decoder attention, x is the query. enc_out is the key and value. output shape: (dim_v, seq_len_dec, batch_size)
-    x = layer.feedforward(x, x)             # feedforward layer. output shape: (dim, seq_len_dec, batch_size)
-    return x
+    _x = layer.attn1(x, x) # self-attention, x is the query, key and value. output shape: (dim_v, seq_len_dec, batch_size)
+    _x = layer.attn2(_x, _x, enc_out, enc_out) # encoder-decoder attention, _x is the query. enc_out is the key and value. output shape: (dim_v, seq_len_dec, batch_size)
+
+    L = size(x, 2)
+    incremental = !haskey(ENV, "DISABLE_INCREMENTAL_ATTENTION") || ENV["DISABLE_INCREMENTAL_ATTENTION"] != "true"
+    if incremental && layer.cache === nothing
+        incremental=false
+    end
+    if incremental
+        prev_x, _x_old = layer.cache
+        if size(prev_x, 2) != L - 1 || selectdim(prev_x, 2, 1) != selectdim(x, 2, 1) || selectdim(prev_x, 2, L-1) != selectdim(x, 2, L-1)
+            incremental = false
+        end
+    end
+    if incremental
+        _x_new = selectdim(_x, 2, L) |> copy # TODO: do we need to create copies?
+        _x_new = layer.feedforward(_x_new, _x_new)     # feedforward layer. output shape: (dim_ff, 1, batch_size)
+        _x = cat(_x_old, _x_new, dims=2) # shape: (dim_ff, seq_len_dec, batch_size)
+    else
+        _x = layer.feedforward(_x, _x)     # feedforward layer. output shape: (dim_ff, seq_len_dec, batch_size)
+    end
+    layer.cache = copy.((x, _x))
+    return _x
 end
 
 """
@@ -254,9 +274,28 @@ end
 - `x`: input to the decoder layer of shape (dim, seq_len_dec, batch_size)
 """
 function (layer::DecoderLayer)(x)
-    x = layer.attn1(x, x) # self-attention, x is the query, key and value. output shape: (dim_v, seq_len_dec, batch_size)
-    x = layer.feedforward(x, x)     # feedforward layer. output shape: (dim_ff, seq_len_dec, batch_size)
-    return x
+    _x = layer.attn1(x, x) # self-attention, x is the query, key and value. output shape: (dim_v, seq_len_dec, batch_size)
+    
+    L = size(x, 2)
+    incremental = !haskey(ENV, "DISABLE_INCREMENTAL_ATTENTION") || ENV["DISABLE_INCREMENTAL_ATTENTION"] != "true"
+    if incremental && layer.cache === nothing
+        incremental=false
+    end
+    if incremental
+        prev_x, _x_old = layer.cache
+        if size(prev_x, 2) != L - 1 || selectdim(prev_x, 2, 1) != selectdim(x, 2, 1) || selectdim(prev_x, 2, L-1) != selectdim(x, 2, L-1)
+            incremental = false
+        end
+    end
+    if incremental
+        _x_new = selectdim(_x, 2, L) |> copy # TODO: do we need to create copies?
+        _x_new = layer.feedforward(_x_new, _x_new)     # feedforward layer. output shape: (dim_ff, 1, batch_size)
+        _x = cat(_x_old, _x_new, dims=2) # shape: (dim_ff, seq_len_dec, batch_size)
+    else
+        _x = layer.feedforward(_x, _x)     # feedforward layer. output shape: (dim_ff, seq_len_dec, batch_size)
+    end
+    layer.cache = copy.((x, _x))
+    return _x
 end
 
 

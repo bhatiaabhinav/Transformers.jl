@@ -277,13 +277,14 @@ output = mhsa(input); # size (dim_out, seq_len, batch_size)
 ```
 ===
 """
-struct MultiHeadSelfAttention
+mutable struct MultiHeadSelfAttention
     qkvh # a combined linear layer for query, key, value and heads
     linear
     dim_k::Int
     dim_v::Int
     num_heads::Int
     masked::Bool
+    cache
 end
 
 Flux.@functor MultiHeadSelfAttention (qkvh, linear)
@@ -291,7 +292,7 @@ Flux.@functor MultiHeadSelfAttention (qkvh, linear)
 function MultiHeadSelfAttention(dim_inp::Int, dim_k::Int, dim_v::Int, num_heads::Int, dim_out::Int, maksed::Bool)
     qkvh = Dense(dim_inp, (dim_k * 2 + dim_v) * num_heads)
     linear = Dense(dim_v * num_heads, dim_out)
-    return MultiHeadSelfAttention(qkvh, linear, dim_k, dim_v, num_heads, maksed)
+    return MultiHeadSelfAttention(qkvh, linear, dim_k, dim_v, num_heads, maksed, nothing)
 end
 
 
@@ -302,21 +303,66 @@ end
 - `x`: input of size `(dim_inp, seq_len, batch_size)`
 """
 function (mhsa::MultiHeadSelfAttention)(x)
-    qkvh = mhsa.qkvh(x) # ((dim_k * 2 + dim_v) * num_heads, seq_len, batch_size)
+
+    incremental = !haskey(ENV, "DISABLE_INCREMENTAL_ATTENTION") || ENV["DISABLE_INCREMENTAL_ATTENTION"] != "true"
+    L = size(x, 2)
+    if incremental && mhsa.cache === nothing
+        incremental = false
+    end
+    if incremental
+        prev_x, q_old, k_old, v_old, cur_out_old = mhsa.cache
+        if size(prev_x, 2) != L - 1 || selectdim(prev_x, 2, 1) != selectdim(x, 2, 1) || selectdim(prev_x, 2, L-1) != selectdim(x, 2, L-1)
+            incremental = false
+        end
+    end
+
     dim_k, dim_v, num_heads = mhsa.dim_k, mhsa.dim_v, mhsa.num_heads
-    qkvh = reshape(qkvh, (dim_k * 2 + dim_v), num_heads, size(x)[2:end]...) # (dim_k * 2 + dim_v, num_heads, seq_len, batch_size)
-    if ndims(x) == 2 # no batch dimension
-        qkvh = permutedims(qkvh, (1, 3, 2)) # (dim_k * 2 + dim_v, seq_len, num_heads)
+    
+    if incremental
+        xnew = copy(selectdim(x, 2, L:L))  # (dim_inp, 1, batch_size)
+        qkvh_new = mhsa.qkvh(xnew) # ((dim_k * 2 + dim_v) * num_heads, 1, batch_size)
+        qkvh_new = reshape(qkvh_new, (dim_k * 2 + dim_v), num_heads, size(xnew)[2:end]...) # (dim_k * 2 + dim_v, num_heads, 1, batch_size)
+        if ndims(x) == 2 # no batch dimension
+            qkvh_new = permutedims(qkvh_new, (1, 3, 2)) # (dim_k * 2 + dim_v, 1, num_heads)
+        else
+            qkvh_new = permutedims(qkvh_new, (1, 3, 2, 4)) # (dim_k * 2 + dim_v, 1, num_heads, batch_size)
+        end
+        q_new, k_new, v_new = copy(selectdim(qkvh_new, 1, 1:dim_k)), copy(selectdim(qkvh_new, 1, dim_k+1:dim_k*2)), copy(selectdim(qkvh_new, 1, dim_k*2+1:dim_k*2+dim_v))
+        q, k, v = cat(q_old, q_new, dims=2), cat(k_old, k_new, dims=2), cat(v_old, v_new, dims=2)
     else
-        qkvh = permutedims(qkvh, (1, 3, 2, 4)) # (dim_k * 2 + dim_v, seq_len, num_heads, batch_size)
+        qkvh = mhsa.qkvh(x) # ((dim_k * 2 + dim_v) * num_heads, seq_len, batch_size)
+        qkvh = reshape(qkvh, (dim_k * 2 + dim_v), num_heads, size(x)[2:end]...) # (dim_k * 2 + dim_v, num_heads, seq_len, batch_size)
+        if ndims(x) == 2 # no batch dimension
+            qkvh = permutedims(qkvh, (1, 3, 2)) # (dim_k * 2 + dim_v, seq_len, num_heads)
+        else
+            qkvh = permutedims(qkvh, (1, 3, 2, 4)) # (dim_k * 2 + dim_v, seq_len, num_heads, batch_size)
+        end
+        q, k, v = copy(selectdim(qkvh, 1, 1:dim_k)), copy(selectdim(qkvh, 1, dim_k+1:dim_k*2)), copy(selectdim(qkvh, 1, dim_k*2+1:dim_k*2+dim_v))
     end
-    q, k, v = copy(selectdim(qkvh, 1, 1:dim_k)), copy(selectdim(qkvh, 1, dim_k+1:dim_k*2)), copy(selectdim(qkvh, 1, dim_k*2+1:dim_k*2+dim_v))
-    multihead_output = attention(q, k, v, mhsa.masked) # (dim_v, seq_len, num_heads, batch_size)
-    if ndims(x) == 2 # no batch dimension
-        multihead_output = permutedims(multihead_output, (1, 3, 2)) # (dim_v, num_heads, seq_len)
+
+
+    if incremental
+        multihead_output_new = attention(q_new, k, v, false) # (dim_v, 1, num_heads, batch_size)
+
+        if ndims(x) == 2 # no batch dimension
+            multihead_output_new = permutedims(multihead_output_new, (1, 3, 2)) # (dim_v, num_heads, 1)
+        else
+            multihead_output_new = permutedims(multihead_output_new, (1, 3, 2, 4)) # (dim_v, num_heads, 1, batch_size)
+        end
+        multihead_output_new = reshape(multihead_output_new, (dim_v * num_heads, size(multihead_output_new)[3:end]...)) # (dim_v * num_heads, 1, batch_size)
+        cur_out_new = mhsa.linear(multihead_output_new) # (dim_out, 1, batch_size)
+        cur_out = cat(cur_out_old, cur_out_new, dims=2) # (dim_out, seq_len, batch_size)
     else
-        multihead_output = permutedims(multihead_output, (1, 3, 2, 4)) # (dim_v, num_heads, seq_len, batch_size)
+        multihead_output = attention(q, k, v, mhsa.masked) # (dim_v, seq_len, num_heads, batch_size)
+
+        if ndims(x) == 2 # no batch dimension
+            multihead_output = permutedims(multihead_output, (1, 3, 2)) # (dim_v, num_heads, seq_len)
+        else
+            multihead_output = permutedims(multihead_output, (1, 3, 2, 4)) # (dim_v, num_heads, seq_len, batch_size)
+        end
+        multihead_output = reshape(multihead_output, (dim_v * num_heads, size(multihead_output)[3:end]...)) # (dim_v * num_heads, seq_len, batch_size)
+        cur_out = mhsa.linear(multihead_output) # (dim_out, seq_len, batch_size)
     end
-    multihead_output = reshape(multihead_output, (dim_v * num_heads, size(x)[2:end]...)) # (dim_v * num_heads, seq_len, batch_size)
-    return mhsa.linear(multihead_output) # (dim_out, seq_len, batch_size)
+    mhsa.cache = copy.((x, q, k, v, cur_out))
+    return cur_out
 end
