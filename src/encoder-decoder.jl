@@ -255,7 +255,7 @@ function (layer::DecoderLayer)(x, enc_out)
         end
     end
     if incremental
-        _x_new = selectdim(_x, 2, L) |> copy # TODO: do we need to create copies?
+        _x_new = selectdim(_x, 2, L:L) |> copy # TODO: do we need to create copies?
         _x_new = layer.feedforward(_x_new, _x_new)     # feedforward layer. output shape: (dim_ff, 1, batch_size)
         _x = cat(_x_old, _x_new, dims=2) # shape: (dim_ff, seq_len_dec, batch_size)
     else
@@ -275,7 +275,7 @@ end
 """
 function (layer::DecoderLayer)(x)
     _x = layer.attn1(x, x) # self-attention, x is the query, key and value. output shape: (dim_v, seq_len_dec, batch_size)
-    
+ 
     L = size(x, 2)
     incremental = !haskey(ENV, "DISABLE_INCREMENTAL_ATTENTION") || ENV["DISABLE_INCREMENTAL_ATTENTION"] != "true"
     if incremental && layer.cache === nothing
@@ -288,7 +288,7 @@ function (layer::DecoderLayer)(x)
         end
     end
     if incremental
-        _x_new = selectdim(_x, 2, L) |> copy # TODO: do we need to create copies?
+        _x_new = selectdim(_x, 2, L:L) |> copy # TODO: do we need to create copies?
         _x_new = layer.feedforward(_x_new, _x_new)     # feedforward layer. output shape: (dim_ff, 1, batch_size)
         _x = cat(_x_old, _x_new, dims=2) # shape: (dim_ff, seq_len_dec, batch_size)
     else
