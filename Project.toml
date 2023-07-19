@@ -1,9 +1,11 @@
 name = "Transformers"
 uuid = "900cc879-51d9-457a-99d4-f4430d1507c3"
 authors = ["Abhinav Bhatia <abhinav.bhatia.me@gmail.com>"]
-version = "0.2.1"
+version = "0.2.2"
 
 [deps]
+CUDA = "052768ef-5323-5732-b1bb-66c8b64840ba"
 DataStructures = "864edb3b-99cc-5e75-8d2d-829cb0a9cfe8"
 Flux = "587475ba-b771-5e3f-ad9e-33799f191a9c"
 LinearAlgebra = "37e2e46d-f89d-539d-b4ee-838fcccc9c8e"
+cuDNN = "02a925ec-e4fe-4b08-9a7e-0d78e3d38ccd"

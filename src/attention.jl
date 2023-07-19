@@ -1,4 +1,5 @@
 using Flux
+using CUDA
 using LinearAlgebra
 using DataStructures
 
@@ -51,7 +52,7 @@ Accordingly, `Q`, `K`, and `V` are of size `(d_k, seq_len_q, batch_size...)`, `(
 function attention(Q, K, V, masked)
     d_k, seq_len_q = size(Q)[1:2]
     d_v, seq_len_k = size(V)[1:2]
-    device = Q isa Flux.CUDA.CuArray ? gpu : cpu
+    device = Q isa CUDA.CuArray ? gpu : cpu
     mask =  masked ? get_mask((seq_len_k, seq_len_q), device) : 0
     if length(size(Q)) > 2 # batched
         scores = mybatchedtranspose(K) ⊠ Q / Float32(sqrt(d_k)) # (seq_len_k, seq_len_q, batch_size...)
