@@ -427,6 +427,10 @@ function SinusoidalPositionalEncoder(dim::Int, max_seq_length::Int=10000)
     return SinusoidalPositionalEncoder(pe)
 end
 
+function Base.show(io::IO, l::SinusoidalPositionalEncoder)
+    print(io, "SinusoidalPositionalEncoder(", size(l.pe, 1), ")")
+end
+
 """
     LearnedPositionalEncoder(dim::Int, max_seq_length::Int=10000, std=0.01f0)
 
@@ -465,3 +469,6 @@ function (postional_encoder::Union{SinusoidalPositionalEncoder, LearnedPositiona
     return x .+ pe
 end
 
+function Base.show(io::IO, l::LearnedPositionalEncoder)
+    print(io, "LearnedPositionalEncoder(", size(l.pe, 1), ")")
+end
