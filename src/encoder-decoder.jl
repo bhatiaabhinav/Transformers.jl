@@ -59,7 +59,7 @@ end
 
 
 """
-    EncoderLayer(dim::Int, dim_k::Int, dim_v::Int, num_heads::Int, dim_ff::Int; dropout=0.0, σ=gelu)
+    EncoderLayer(dim::Int, dim_k::Int, dim_v::Int, num_heads::Int, dim_ff::Int; dropout=0.0, σ=gelu, linear_attention=false)
 
 Encoder layer for Transformer. It is composed of a multi-head self-attention sublayer followed by a feedforward sublayer. Each sublayer is wrapped with a residual connection, a layer normalization layer and optional dropout. Therefore the size of the input and output of the encoder layer is the same.
 
@@ -71,9 +71,11 @@ Encoder layer for Transformer. It is composed of a multi-head self-attention sub
 - `dim_ff`: hidden dimension of the feedforward sublayer
 - `dropout`: dropout probability for each sublayer
 - `σ`: activation function for the feedforward sublayer (default: `gelu`)
+- `linear_attention`: if `true`, use linear attention instead of dense scaled dot-product attention
 
 # References
 - [Attention Is All You Need](https://arxiv.org/abs/1706.03762)
+- [Transformers are RNNs: Fast Autoregressive Transformers with Linear Attention](https://arxiv.org/pdf/2006.16236.pdf)
 
 # Example
 ```julia
@@ -93,8 +95,9 @@ end
 
 Flux.@functor EncoderLayer
 
-function EncoderLayer(dim::Int, dim_k::Int, dim_v::Int, num_heads::Int, dim_ff::Int; dropout=0.0, σ=gelu)
-    attn = MultiHeadSelfAttention(dim, dim_k, dim_v, num_heads, dim, false)
+function EncoderLayer(dim::Int, dim_k::Int, dim_v::Int, num_heads::Int, dim_ff::Int; dropout=0.0, σ=gelu, linear_attention=false)
+    MHSA_Cls = linear_attention ? MultiHeadLinearSelfAttention : MultiHeadSelfAttention
+    attn = MHSA_Cls(dim, dim_k, dim_v, num_heads, dim, false)
     attn = ResidualAndNorm(attn, dim; dropout=dropout)
     feedforward = Chain(Dense(dim, dim_ff, σ), Dense(dim_ff, dim))
     feedforward = ResidualAndNorm(feedforward, dim; dropout=dropout)
@@ -115,7 +118,7 @@ end
 
 
 """
-    Encoder(dim::Int, dim_k::Int, dim_v::Int, num_heads::Int, dim_ff::Int, num_layers::Int; dropout=0.0, σ=gelu)
+    Encoder(dim::Int, dim_k::Int, dim_v::Int, num_heads::Int, dim_ff::Int, num_layers::Int; dropout=0.0, σ=gelu, linear_attention=false)
 
 Encoder for Transformer. It is composed of a stack of encoder layers and the final output is the output of the last encoder layer. The input is assumed to be already embedded and positional encoded.
 
@@ -128,9 +131,11 @@ Encoder for Transformer. It is composed of a stack of encoder layers and the fin
 - `num_layers`: number of encoder layers
 - `dropout`: dropout probability for each sublayer
 - `σ`: activation function for the feedforward sublayer in each encoder layer (default: `gelu`)
+- `linear_attention`: if `true`, use linear attention instead of dense scaled dot-product attention
 
 # References
 - [Attention Is All You Need](https://arxiv.org/abs/1706.03762)
+- [Transformers are RNNs: Fast Autoregressive Transformers with Linear Attention](https://arxiv.org/pdf/2006.16236.pdf)
 
 # Example
 ```julia
@@ -148,8 +153,8 @@ struct Encoder
 end
 Flux.@functor Encoder
 
-function Encoder(dim::Int, dim_k::Int, dim_v::Int, num_heads::Int, dim_ff::Int, num_layers::Int; dropout=0.0, σ=gelu)
-    layers = [EncoderLayer(dim, dim_k, dim_v, num_heads, dim_ff; dropout=dropout, σ=σ) for _ in 1:num_layers]
+function Encoder(dim::Int, dim_k::Int, dim_v::Int, num_heads::Int, dim_ff::Int, num_layers::Int; dropout=0.0, σ=gelu, linear_attention=false)
+    layers = [EncoderLayer(dim, dim_k, dim_v, num_heads, dim_ff; dropout=dropout, σ=σ, linear_attention=linear_attention) for _ in 1:num_layers]
     return Encoder(layers)
 end
 
@@ -177,7 +182,7 @@ end
 
 
 """
-    DecoderLayer(dim::Int, dim_k::Int, dim_v::Int, num_heads::Int, dim_ff::Int; dropout=0.0, σ=gelu, no_encoder=false)
+    DecoderLayer(dim::Int, dim_k::Int, dim_v::Int, num_heads::Int, dim_ff::Int; dropout=0.0, σ=gelu, no_encoder=false, linear_attention=false)
 
 Decoder layer for Transformer. It is composed of a masked multi-head self-attention attention sublayer, a multi-head encoder-decoder attention sublayer that accepts key and value input from the encoder (potentially of different seq_len) while accepting query input from the first sublayer, and a feedforward sublayer. If no encoder output is provided during inference, then the encoder-decoder attention sublayer is ignored. Each sublayer is wrapped with a residual connection, a layer normalization layer and optional dropout. The output of the decoder layer has the same size and sequence length as the output of the previous decoder layer.
 
@@ -190,9 +195,11 @@ Decoder layer for Transformer. It is composed of a masked multi-head self-attent
 - `dropout`: dropout probability for each sublayer
 - `σ`: activation function for the feedforward sublayer (default: `gelu`)
 - `no_encoder`: if `true`, ignore the encoder-decoder attention sublayer. This is useful when no encoder output is provided.
+- `linear_attention`: if `true`, use linear attention instead of dense scaled dot-product attention
 
 # References
 - [Attention Is All You Need](https://arxiv.org/abs/1706.03762)
+- [Transformers are RNNs: Fast Autoregressive Transformers with Linear Attention](https://arxiv.org/pdf/2006.16236.pdf)
 
 # Example
 ```julia
@@ -218,11 +225,12 @@ mutable struct DecoderLayer
 end
 Flux.@functor DecoderLayer (attn1, attn2, feedforward)
 
-function DecoderLayer(dim::Int, dim_k::Int, dim_v::Int, num_heads::Int, dim_ff::Int; dropout=0.0, σ=gelu, no_encoder=false)
-    attn1 = MultiHeadSelfAttention(dim, dim_k, dim_v, num_heads, dim, true)
+function DecoderLayer(dim::Int, dim_k::Int, dim_v::Int, num_heads::Int, dim_ff::Int; dropout=0.0, σ=gelu, no_encoder=false, linear_attention=false)
+    MHSA_Cls = linear_attention ? MultiHeadLinearSelfAttention : MultiHeadSelfAttention
+    attn1 = MHSA_Cls(dim, dim_k, dim_v, num_heads, dim, true)
     attn1 = ResidualAndNorm(attn1, dim; dropout=dropout)
     if !no_encoder
-        attn2 = MultiHeadAttention(dim, dim_k, dim_v, num_heads, dim, false)
+        attn2 = MHSA_Cls(dim, dim_k, dim_v, num_heads, dim, false)
         attn2 = ResidualAndNorm(attn2, dim; dropout=dropout)
     else
         attn2 = nothing
@@ -250,7 +258,7 @@ function (layer::DecoderLayer)(x, enc_out)
     end
     if incremental
         prev_x, _x_old = layer.cache
-        if size(prev_x, 2) != L - 1 || selectdim(prev_x, 2, 1) != selectdim(x, 2, 1) || selectdim(prev_x, 2, L-1) != selectdim(x, 2, L-1)
+        if size(prev_x, 2) != L - 1 || !(sum(selectdim(prev_x, 2, 1)) ≈ sum(selectdim(x, 2, 1))) || !(sum(selectdim(prev_x, 2, L-1)) ≈ sum(selectdim(x, 2, L-1)))
             incremental = false
         end
     end
@@ -283,18 +291,18 @@ function (layer::DecoderLayer)(x)
     end
     if incremental
         prev_x, _x_old = layer.cache
-        if size(prev_x, 2) != L - 1 || selectdim(prev_x, 2, 1) != selectdim(x, 2, 1) || selectdim(prev_x, 2, L-1) != selectdim(x, 2, L-1)
+        if size(prev_x, 2) != L - 1 || !(sum(selectdim(prev_x, 2, 1)) ≈ sum(selectdim(x, 2, 1))) || !(sum(selectdim(prev_x, 2, L-1)) ≈ sum(selectdim(x, 2, L-1)))
             incremental = false
         end
     end
     if incremental
-        _x_new = selectdim(_x, 2, L:L) |> copy # TODO: do we need to create copies?
+        _x_new = selectdim(_x, 2, L:L) |> copy
         _x_new = layer.feedforward(_x_new, _x_new)     # feedforward layer. output shape: (dim_ff, 1, batch_size)
         _x = cat(_x_old, _x_new, dims=2) # shape: (dim_ff, seq_len_dec, batch_size)
     else
         _x = layer.feedforward(_x, _x)     # feedforward layer. output shape: (dim_ff, seq_len_dec, batch_size)
     end
-    layer.cache = copy.((x, _x))
+    layer.cache = (copy(x), _x)
     return _x
 end
 
@@ -302,7 +310,7 @@ end
 
 
 """
-    Decoder(dim::Int, dim_k::Int, dim_v::Int, num_heads::Int, dim_ff::Int, num_layers::Int; dropout=0.0, σ=gelu, no_encoder=false)
+    Decoder(dim::Int, dim_k::Int, dim_v::Int, num_heads::Int, dim_ff::Int, num_layers::Int; dropout=0.0, σ=gelu, no_encoder=false, linear_attention=false)
 
 Decoder for Transformer. It is composed of a stack of decoder layers and the output is the output of the last decoder layer. The input is assumed to be already embedded and positional encoded. The decoder also needs the output of the encoder to perform encoder-decoder attention. If no encoder output is provided during inference, then each decoder layer performs self-attention only and ignores the encoder-decoder attention sublayer.
 
@@ -316,9 +324,11 @@ Decoder for Transformer. It is composed of a stack of decoder layers and the out
 - `dropout`: dropout probability for each sublayer in each decoder layer
 - `σ`: activation function for the feedforward sublayer in each decoder layer (default: `gelu`)
 - `no_encoder`: if `true`, ignore the encoder-decoder attention sublayer in each decoder layer. This is useful when no encoder output is provided.
+- `linear_attention`: if `true`, use linear attention instead of dense scaled dot-product attention
 
 # References
 - [Attention Is All You Need](https://arxiv.org/abs/1706.03762)
+- [Transformers are RNNs: Fast Autoregressive Transformers with Linear Attention](https://arxiv.org/pdf/2006.16236.pdf)
 
 # Example
 ```julia
@@ -340,8 +350,8 @@ struct Decoder
     layers::Vector{DecoderLayer}
 end
 Flux.@functor Decoder
-function Decoder(dim::Int, dim_k::Int, dim_v::Int, num_heads::Int, dim_ff::Int, num_layers::Int; dropout=0.0, σ=gelu, no_encoder=false)
-    layers = [DecoderLayer(dim, dim_k, dim_v, num_heads, dim_ff; dropout=dropout, σ=σ, no_encoder=no_encoder) for _ in 1:num_layers]
+function Decoder(dim::Int, dim_k::Int, dim_v::Int, num_heads::Int, dim_ff::Int, num_layers::Int; dropout=0.0, σ=gelu, no_encoder=false, linear_attention=false)
+    layers = [DecoderLayer(dim, dim_k, dim_v, num_heads, dim_ff; dropout=dropout, σ=σ, no_encoder=no_encoder, linear_attention=linear_attention) for _ in 1:num_layers]
     return Decoder(layers)
 end
 
