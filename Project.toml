@@ -1,7 +1,7 @@
 name = "Transformers"
 uuid = "900cc879-51d9-457a-99d4-f4430d1507c3"
 authors = ["Abhinav Bhatia <abhinav.bhatia.me@gmail.com>"]
-version = "0.2.4"
+version = "0.2.5"
 
 [deps]
 CUDA = "052768ef-5323-5732-b1bb-66c8b64840ba"

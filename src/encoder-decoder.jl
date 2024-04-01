@@ -290,8 +290,8 @@ function (layer::DecoderLayer)(x)
         incremental=false
     end
     if incremental
-        prev_x, _x_old = layer.cache
-        if size(prev_x, 2) != L - 1 || !(sum(selectdim(prev_x, 2, 1)) ≈ sum(selectdim(x, 2, 1))) || !(sum(selectdim(prev_x, 2, L-1)) ≈ sum(selectdim(x, 2, L-1)))
+        prev_L, _x_old = layer.cache
+        if prev_L != L - 1
             incremental = false
         end
     end
@@ -299,10 +299,14 @@ function (layer::DecoderLayer)(x)
         _x_new = selectdim(_x, 2, L:L) |> copy
         _x_new = layer.feedforward(_x_new, _x_new)     # feedforward layer. output shape: (dim_ff, 1, batch_size)
         _x = cat(_x_old, _x_new, dims=2) # shape: (dim_ff, seq_len_dec, batch_size)
+        if isa(x, CUDA.CuArray)
+            CUDA.unsafe_free!(_x_new)
+            CUDA.unsafe_free!(_x_old)
+        end
     else
         _x = layer.feedforward(_x, _x)     # feedforward layer. output shape: (dim_ff, seq_len_dec, batch_size)
     end
-    layer.cache = (copy(x), _x)
+    layer.cache = (L, _x)
     return _x
 end
 

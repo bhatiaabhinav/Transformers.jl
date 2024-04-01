@@ -49,7 +49,7 @@ Accordingly, `Q`, `K`, and `V` are of size `(d_k, seq_len_q, batch_size...)`, `(
 # References
 - [Attention Is All You Need](https://arxiv.org/abs/1706.03762)
 """
-function attention(Q, K, V, masked)
+function attention(Q, K, V, masked, dilation=1)
     d_k, seq_len_q = size(Q)[1:2]
     d_v, seq_len_k = size(V)[1:2]
     device = Q isa CUDA.CuArray ? gpu : cpu
@@ -59,13 +59,30 @@ function attention(Q, K, V, masked)
     Q = reshape(Q, d_k, seq_len_q, batch_size)
     K = reshape(K, d_k, seq_len_k, batch_size)
     V = reshape(V, d_v, seq_len_k, batch_size)
-    scores = mybatchedtranspose(K) ⊠ Q / Float32(sqrt(d_k)) # (seq_len_k, seq_len_q, batch_size)
+    if dilation > 1
+        K = K[:, 1:dilation:end, :]
+    end
+    # println("K: ", size(K))
+    # scores = mybatchedtranspose(K) ⊠ Q / Float32(sqrt(d_k)) # (seq_len_k, seq_len_q, batch_size)
+    scores = batched_transpose(K) ⊠ Q / Float32(sqrt(d_k)) # (seq_len_k, seq_len_q, batch_size)
+    # println("scores: ", size(scores))
+    if dilation > 1
+        scores = dilate_back(scores, (seq_len_k, seq_len_q, batch_size), dilation)
+    end
+    # println("scores final: ", size(scores))
     scores = scores .+ mask
     attn = softmax(scores, dims=1) # (seq_len_k, seq_len_q, batch_size)
     # Flux.Zygote.@ignore push!(attn_hisory, cpu(attn))
     ret_val = V ⊠ attn # (d_v, seq_len_q, batch_size)
     ret_val = reshape(ret_val, d_v, seq_len_q, batch_size_orig...)
     return ret_val
+end
+
+function dilate_back(A, output_size, step_size)
+    B = Flux.Zygote.Buffer(A, output_size)
+    B[:, :, :] = convert(typeof(A), fill(-Inf, size(B)))
+    B[1:step_size:end, :, :] = A
+    return copy(B)
 end
 
 
@@ -308,8 +325,8 @@ function (mhsa::MultiHeadSelfAttention)(x)
         incremental = false
     end
     if incremental
-        prev_x, q_old, k_old, v_old, cur_out_old = mhsa.cache
-        if size(prev_x, 2) != L - 1 || !(sum(selectdim(prev_x, 2, 1)) ≈ sum(selectdim(x, 2, 1))) || !(sum(selectdim(prev_x, 2, L-1)) ≈ sum(selectdim(x, 2, L-1)))
+        prev_L, q_old, k_old, v_old, cur_out_old = mhsa.cache
+        if prev_L != L - 1
             incremental = false
         end
     end
@@ -327,6 +344,15 @@ function (mhsa::MultiHeadSelfAttention)(x)
         end
         q_new, k_new, v_new = copy(selectdim(qkvh_new, 1, 1:dim_k)), copy(selectdim(qkvh_new, 1, dim_k+1:dim_k*2)), copy(selectdim(qkvh_new, 1, dim_k*2+1:dim_k*2+dim_v))
         q, k, v = cat(q_old, q_new, dims=2), cat(k_old, k_new, dims=2), cat(v_old, v_new, dims=2)
+        if isa(x, CUDA.CuArray)
+            CUDA.unsafe_free!(xnew)
+            CUDA.unsafe_free!(qkvh_new)
+            CUDA.unsafe_free!(k_new)
+            CUDA.unsafe_free!(v_new)
+            CUDA.unsafe_free!(q_old)
+            CUDA.unsafe_free!(k_old)
+            CUDA.unsafe_free!(v_old)
+        end
     else
         qkvh = mhsa.qkvh(x) # ((dim_k * 2 + dim_v) * num_heads, seq_len, batch_size)
         qkvh = reshape(qkvh, (dim_k * 2 + dim_v), num_heads, size(x)[2:end]...) # (dim_k * 2 + dim_v, num_heads, seq_len, batch_size)
@@ -341,7 +367,6 @@ function (mhsa::MultiHeadSelfAttention)(x)
 
     if incremental
         multihead_output_new = attention(q_new, k, v, false) # (dim_v, 1, num_heads, batch_size)
-
         if ndims(x) == 2 # no batch dimension
             multihead_output_new = permutedims(multihead_output_new, (1, 3, 2)) # (dim_v, num_heads, 1)
         else
@@ -350,9 +375,14 @@ function (mhsa::MultiHeadSelfAttention)(x)
         multihead_output_new = reshape(multihead_output_new, (dim_v * num_heads, size(multihead_output_new)[3:end]...)) # (dim_v * num_heads, 1, batch_size)
         cur_out_new = mhsa.linear(multihead_output_new) # (dim_out, 1, batch_size)
         cur_out = cat(cur_out_old, cur_out_new, dims=2) # (dim_out, seq_len, batch_size)
+        if isa(x, CUDA.CuArray)
+            CUDA.unsafe_free!(q_new)
+            CUDA.unsafe_free!(multihead_output_new)
+            CUDA.unsafe_free!(cur_out_new)
+            CUDA.unsafe_free!(cur_out_old)
+        end
     else
         multihead_output = attention(q, k, v, mhsa.masked) # (dim_v, seq_len, num_heads, batch_size)
-
         if ndims(x) == 2 # no batch dimension
             multihead_output = permutedims(multihead_output, (1, 3, 2)) # (dim_v, num_heads, seq_len)
         else
@@ -361,7 +391,7 @@ function (mhsa::MultiHeadSelfAttention)(x)
         multihead_output = reshape(multihead_output, (dim_v * num_heads, size(multihead_output)[3:end]...)) # (dim_v * num_heads, seq_len, batch_size)
         cur_out = mhsa.linear(multihead_output) # (dim_out, seq_len, batch_size)
     end
-    mhsa.cache = copy.((x, q, k, v, cur_out))
+    mhsa.cache = (L, q, k, v, cur_out)
     return cur_out
 end
 
@@ -431,8 +461,8 @@ function (mhsa::MultiHeadLinearSelfAttention)(x)
     end
     linear_attn_cache = nothing
     if incremental
-        prev_x, q_old, k_old, v_old, cur_out_old, linear_attn_cache = mhsa.cache
-        if !mhsa.masked || size(prev_x, 2) != L - 1 || !(sum(selectdim(prev_x, 2, 1)) ≈ sum(selectdim(x, 2, 1))) || !(sum(selectdim(prev_x, 2, L-1)) ≈ sum(selectdim(x, 2, L-1)))
+        prev_L, q_old, k_old, v_old, cur_out_old, linear_attn_cache = mhsa.cache
+        if !mhsa.masked || prev_L != L - 1
             incremental = false
         end
     end
@@ -450,6 +480,13 @@ function (mhsa::MultiHeadLinearSelfAttention)(x)
         end
         q_new, k_new, v_new = copy(selectdim(qkvh_new, 1, 1:dim_k)), copy(selectdim(qkvh_new, 1, dim_k+1:dim_k*2)), copy(selectdim(qkvh_new, 1, dim_k*2+1:dim_k*2+dim_v))
         q, k, v = cat(q_old, q_new, dims=2), cat(k_old, k_new, dims=2), cat(v_old, v_new, dims=2)
+        if isa(x, CUDA.CuArray)
+            CUDA.unsafe_free!(xnew)
+            CUDA.unsafe_free!(qkvh_new)
+            CUDA.unsafe_free!(q_old)
+            CUDA.unsafe_free!(k_old)
+            CUDA.unsafe_free!(v_old)
+        end
     else
         qkvh = mhsa.qkvh(x) # ((dim_k * 2 + dim_v) * num_heads, seq_len, batch_size)
         qkvh = reshape(qkvh, (dim_k * 2 + dim_v), num_heads, size(x)[2:end]...) # (dim_k * 2 + dim_v, num_heads, seq_len, batch_size)
@@ -471,7 +508,8 @@ function (mhsa::MultiHeadLinearSelfAttention)(x)
     end
 
     if incremental
-        multihead_output_new, linear_attn_cache = linear_attention_causal_incremental!(q_new, k_new, v_new, linear_attn_cache) # (dim_v, 1, num_heads, batch_size)
+        linear_attn_cache_old = linear_attn_cache
+        multihead_output_new, linear_attn_cache = linear_attention_causal_incremental!(q_new, k_new, v_new, linear_attn_cache_old) # (dim_v, 1, num_heads, batch_size)
         if ndims(x) == 2 # no batch dimension
             multihead_output_new = permutedims(multihead_output_new, (1, 3, 2)) # (dim_v, num_heads, 1)
         else
@@ -480,6 +518,16 @@ function (mhsa::MultiHeadLinearSelfAttention)(x)
         multihead_output_new = reshape(multihead_output_new, (dim_v * num_heads, size(multihead_output_new)[3:end]...)) # (dim_v * num_heads, 1, batch_size)
         cur_out_new = mhsa.linear(multihead_output_new) # (dim_out, 1, batch_size)
         cur_out = cat(cur_out_old, cur_out_new, dims=2) # (dim_out, seq_len, batch_size)
+        if isa(x, CUDA.CuArray)
+            CUDA.unsafe_free!(q_new)
+            CUDA.unsafe_free!(k_new)
+            CUDA.unsafe_free!(v_new)
+            CUDA.unsafe_free!(multihead_output_new)
+            CUDA.unsafe_free!(cur_out_new)
+            CUDA.unsafe_free!(cur_out_old)
+            CUDA.unsafe_free!(linear_attn_cache_old[1])
+            CUDA.unsafe_free!(linear_attn_cache_old[2])
+        end
     else
         if mhsa.masked
             multihead_output, linear_attn_cache = linear_attention(q, k, v, true; return_cache=true) # (dim_v, seq_len, num_heads, batch_size)
@@ -494,6 +542,6 @@ function (mhsa::MultiHeadLinearSelfAttention)(x)
         multihead_output = reshape(multihead_output, (dim_v * num_heads, size(multihead_output)[3:end]...)) # (dim_v * num_heads, seq_len, batch_size)
         cur_out = mhsa.linear(multihead_output) # (dim_out, seq_len, batch_size)
     end
-    mhsa.cache = Flux.Zygote.@ignore (copy(x), q, k, v, cur_out, linear_attn_cache)
+    mhsa.cache = (L, q, k, v, cur_out, linear_attn_cache)
     return cur_out
 end
