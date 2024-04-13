@@ -425,8 +425,8 @@ y = spe(x)  # size (512, 10);
 struct SinusoidalPositionalEncoder
     pe::AbstractArray{Float32, 2} # of shape (dim, max_seq_len)
 end
-Flux.gpu(spe::SinusoidalPositionalEncoder) = SinusoidalPositionalEncoder(gpu(spe.pe))
-Flux.cpu(spe::SinusoidalPositionalEncoder) = SinusoidalPositionalEncoder(cpu(spe.pe))
+Flux.@functor SinusoidalPositionalEncoder
+Flux.trainable(l::SinusoidalPositionalEncoder) = ()
 
 function SinusoidalPositionalEncoder(dim::Int, max_seq_length::Int=10000)
     pe = zeros(Float32, (dim, max_seq_length))
