@@ -251,47 +251,15 @@ function (layer::DecoderLayer)(x, enc_out)
     _x = layer.attn1(x, x) # self-attention, x is the query, key and value. output shape: (dim_v, seq_len_dec, batch_size)
     _x = layer.attn2(_x, _x, enc_out, enc_out) # encoder-decoder attention, _x is the query. enc_out is the key and value. output shape: (dim_v, seq_len_dec, batch_size)
 
-    L = size(x, 2)
+    D, L, B = size(x, 1), size(x, 2), size(x)[3:end]
     incremental = !haskey(ENV, "DISABLE_INCREMENTAL_ATTENTION") || ENV["DISABLE_INCREMENTAL_ATTENTION"] != "true"
     if incremental && layer.cache === nothing
         incremental=false
     end
     if incremental
-        prev_x, _x_old = layer.cache
-        if size(prev_x, 2) != L - 1 || !(sum(selectdim(prev_x, 2, 1)) ≈ sum(selectdim(x, 2, 1))) || !(sum(selectdim(prev_x, 2, L-1)) ≈ sum(selectdim(x, 2, L-1)))
-            incremental = false
-        end
-    end
-    if incremental
-        _x_new = selectdim(_x, 2, L:L) |> copy # TODO: do we need to create copies?
-        _x_new = layer.feedforward(_x_new, _x_new)     # feedforward layer. output shape: (dim_ff, 1, batch_size)
-        _x = cat(_x_old, _x_new, dims=2) # shape: (dim_ff, seq_len_dec, batch_size)
-    else
-        _x = layer.feedforward(_x, _x)     # feedforward layer. output shape: (dim_ff, seq_len_dec, batch_size)
-    end
-    layer.cache = copy.((x, _x))
-    return _x
-end
-
-"""
-    (layer::DecoderLayer)(x)
-
-    Ignores the encoder output and performs self-attention only i.e., the encoder-decoder attention sublayer is ignored.
-
-# Arguments
-- `x`: input to the decoder layer of shape (dim, seq_len_dec, batch_size)
-"""
-function (layer::DecoderLayer)(x)
-    _x = layer.attn1(x, x) # self-attention, x is the query, key and value. output shape: (dim_v, seq_len_dec, batch_size)
- 
-    L = size(x, 2)
-    incremental = !haskey(ENV, "DISABLE_INCREMENTAL_ATTENTION") || ENV["DISABLE_INCREMENTAL_ATTENTION"] != "true"
-    if incremental && layer.cache === nothing
-        incremental=false
-    end
-    if incremental
-        prev_L, _x_old = layer.cache
-        if prev_L != L - 1
+        prev_size, _x_old = layer.cache
+        prev_D, prev_L, prev_B = prev_size[1], prev_size[2], prev_size[3:end]
+        if prev_L != L - 1 || prev_D != D || prev_B != B
             incremental = false
         end
     end
@@ -306,7 +274,45 @@ function (layer::DecoderLayer)(x)
     else
         _x = layer.feedforward(_x, _x)     # feedforward layer. output shape: (dim_ff, seq_len_dec, batch_size)
     end
-    layer.cache = (L, _x)
+    layer.cache = (size(x), _x)
+    return _x
+end
+
+"""
+    (layer::DecoderLayer)(x)
+
+    Ignores the encoder output and performs self-attention only i.e., the encoder-decoder attention sublayer is ignored.
+
+# Arguments
+- `x`: input to the decoder layer of shape (dim, seq_len_dec, batch_size)
+"""
+function (layer::DecoderLayer)(x)
+    _x = layer.attn1(x, x) # self-attention, x is the query, key and value. output shape: (dim_v, seq_len_dec, batch_size)
+ 
+    D, L, B = size(x, 1), size(x, 2), size(x)[3:end]
+    incremental = !haskey(ENV, "DISABLE_INCREMENTAL_ATTENTION") || ENV["DISABLE_INCREMENTAL_ATTENTION"] != "true"
+    if incremental && layer.cache === nothing
+        incremental=false
+    end
+    if incremental
+        prev_size, _x_old = layer.cache
+        prev_D, prev_L, prev_B = prev_size[1], prev_size[2], prev_size[3:end]
+        if prev_L != L - 1 || prev_D != D || prev_B != B
+            incremental = false
+        end
+    end
+    if incremental
+        _x_new = selectdim(_x, 2, L:L) |> copy
+        _x_new = layer.feedforward(_x_new, _x_new)     # feedforward layer. output shape: (dim_ff, 1, batch_size)
+        _x = cat(_x_old, _x_new, dims=2) # shape: (dim_ff, seq_len_dec, batch_size)
+        if isa(x, CUDA.CuArray)
+            CUDA.unsafe_free!(_x_new)
+            CUDA.unsafe_free!(_x_old)
+        end
+    else
+        _x = layer.feedforward(_x, _x)     # feedforward layer. output shape: (dim_ff, seq_len_dec, batch_size)
+    end
+    layer.cache = (size(x), _x)
     return _x
 end
 

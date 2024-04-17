@@ -320,13 +320,14 @@ end
 function (mhsa::MultiHeadSelfAttention)(x)
 
     incremental = !haskey(ENV, "DISABLE_INCREMENTAL_ATTENTION") || ENV["DISABLE_INCREMENTAL_ATTENTION"] != "true"
-    L = size(x, 2)
+    D, L, B = size(x, 1), size(x, 2), size(x)[3:end]
     if incremental && mhsa.cache === nothing
         incremental = false
     end
     if incremental
-        prev_L, q_old, k_old, v_old, cur_out_old = mhsa.cache
-        if prev_L != L - 1
+        prev_shape, q_old, k_old, v_old, cur_out_old = mhsa.cache
+        prev_D, prev_L, prev_B = prev_shape[1], prev_shape[2], prev_shape[3:end]
+        if prev_L != L - 1 || prev_D != D || prev_B != B
             incremental = false
         end
     end
@@ -391,7 +392,7 @@ function (mhsa::MultiHeadSelfAttention)(x)
         multihead_output = reshape(multihead_output, (dim_v * num_heads, size(multihead_output)[3:end]...)) # (dim_v * num_heads, seq_len, batch_size)
         cur_out = mhsa.linear(multihead_output) # (dim_out, seq_len, batch_size)
     end
-    mhsa.cache = (L, q, k, v, cur_out)
+    mhsa.cache = (size(x), q, k, v, cur_out)
     return cur_out
 end
 
@@ -455,14 +456,15 @@ end
 function (mhsa::MultiHeadLinearSelfAttention)(x)
 
     incremental = !haskey(ENV, "DISABLE_INCREMENTAL_ATTENTION") || ENV["DISABLE_INCREMENTAL_ATTENTION"] != "true"
-    L = size(x, 2)
+    D, L, B = size(x, 1), size(x, 2), size(x)[3:end]
     if incremental && mhsa.cache === nothing
         incremental = false
     end
     linear_attn_cache = nothing
     if incremental
-        prev_L, q_old, k_old, v_old, cur_out_old, linear_attn_cache = mhsa.cache
-        if !mhsa.masked || prev_L != L - 1
+        prev_size, q_old, k_old, v_old, cur_out_old, linear_attn_cache = mhsa.cache
+        prev_D, prev_L, prev_B = prev_size[1], prev_size[2], prev_size[3:end]
+        if !mhsa.masked || prev_L != L - 1 || prev_D != D || prev_B != B
             incremental = false
         end
     end
@@ -542,6 +544,6 @@ function (mhsa::MultiHeadLinearSelfAttention)(x)
         multihead_output = reshape(multihead_output, (dim_v * num_heads, size(multihead_output)[3:end]...)) # (dim_v * num_heads, seq_len, batch_size)
         cur_out = mhsa.linear(multihead_output) # (dim_out, seq_len, batch_size)
     end
-    mhsa.cache = (L, q, k, v, cur_out, linear_attn_cache)
+    mhsa.cache = (size(x), q, k, v, cur_out, linear_attn_cache)
     return cur_out
 end
