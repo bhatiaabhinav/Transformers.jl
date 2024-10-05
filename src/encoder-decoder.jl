@@ -24,7 +24,7 @@ r(r_input, sublayer_input, optional_sublayer_input_args...) # size (10, 32)
 """
 struct ResidualAndNorm
     sublayer
-    layernorm::LayerNorm
+    layernorm
     dropout::Union{Dropout, Nothing}
 end
 Flux.@functor ResidualAndNorm
@@ -190,6 +190,7 @@ Decoder layer for Transformer. It is composed of a masked multi-head self-attent
 - `dropout`: dropout probability for each sublayer
 - `σ`: activation function for the feedforward sublayer (default: `gelu`)
 - `no_encoder`: if `true`, ignore the encoder-decoder attention sublayer. This is useful when no encoder output is provided.
+- `incremental_inference_mode`: whether to enable incremental caching for causal self attention. This is useful for auto-regressive or incremental decoding for faster/linear inference at each time step. When enabled, only one input should be passed to the model at a time (the previous KVs are already cached) and you should call `Flux.reset!` to reset the cache to allow a sequence of inputs at once (as usual e.g., in training).
 
 # References
 - [Attention Is All You Need](https://arxiv.org/abs/1706.03762)
@@ -211,15 +212,15 @@ output = decoder_layer(x);            # size (512, seq_len, batch_size)
 ===
 """
 mutable struct DecoderLayer
-    attn1::ResidualAndNorm
-    attn2::Union{ResidualAndNorm, Nothing} # if `no_encoder`, then this is set to nothing
-    feedforward::ResidualAndNorm
-    cache
+    attn1
+    attn2 # if `no_encoder`, then this is set to nothing
+    feedforward
 end
 Flux.@functor DecoderLayer (attn1, attn2, feedforward)
 
-function DecoderLayer(dim::Int, dim_k::Int, dim_v::Int, num_heads::Int, dim_ff::Int; dropout=0.0, σ=gelu, no_encoder=false)
-    attn1 = MultiHeadSelfAttention(dim, dim_k, dim_v, num_heads, dim, true)
+function DecoderLayer(dim::Int, dim_k::Int, dim_v::Int, num_heads::Int, dim_ff::Int; dropout=0.0, σ=gelu, no_encoder=false, incremental_inference_mode=false)
+    # attn1 = nothing
+    attn1 = MultiHeadSelfAttention(dim, dim_k, dim_v, num_heads, dim, true; incremental_inference_mode=incremental_inference_mode)
     attn1 = ResidualAndNorm(attn1, dim; dropout=dropout)
     if !no_encoder
         attn2 = MultiHeadAttention(dim, dim_k, dim_v, num_heads, dim, false)
@@ -229,7 +230,7 @@ function DecoderLayer(dim::Int, dim_k::Int, dim_v::Int, num_heads::Int, dim_ff::
     end
     feedforward = Chain(Dense(dim, dim_ff, σ), Dense(dim_ff, dim))
     feedforward = ResidualAndNorm(feedforward, dim; dropout=dropout)
-    return DecoderLayer(attn1, attn2, feedforward, nothing)
+    return DecoderLayer(attn1, attn2, feedforward)
 end
 
 """
@@ -242,25 +243,7 @@ end
 function (layer::DecoderLayer)(x, enc_out)
     _x = layer.attn1(x, x) # self-attention, x is the query, key and value. output shape: (dim_v, seq_len_dec, batch_size)
     _x = layer.attn2(_x, _x, enc_out, enc_out) # encoder-decoder attention, _x is the query. enc_out is the key and value. output shape: (dim_v, seq_len_dec, batch_size)
-
-    L = size(x, 2)
-    incremental = !haskey(ENV, "DISABLE_INCREMENTAL_ATTENTION") || ENV["DISABLE_INCREMENTAL_ATTENTION"] != "true"
-    if incremental && layer.cache === nothing
-        incremental=false
-    end
-    if incremental
-        prev_x, _x_old = layer.cache
-        if size(prev_x, 2) != L - 1 || selectdim(prev_x, 2, 1) != selectdim(x, 2, 1) || selectdim(prev_x, 2, L-1) != selectdim(x, 2, L-1)
-            incremental = false
-        end
-    end
-    if incremental
-        _x_new = selectdim(_x, 2, L:L) |> copy # TODO: do we need to create copies?
-        _x_new = layer.feedforward(_x_new, _x_new)     # feedforward layer. output shape: (dim_ff, 1, batch_size)
-        _x = cat(_x_old, _x_new, dims=2) # shape: (dim_ff, seq_len_dec, batch_size)
-    else
-        _x = layer.feedforward(_x, _x)     # feedforward layer. output shape: (dim_ff, seq_len_dec, batch_size)
-    end
+    _x = layer.feedforward(_x)     # feedforward layer. output shape: (dim_ff, seq_len_dec, batch_size)
     layer.cache = copy.((x, _x))
     return _x
 end
@@ -274,27 +257,9 @@ end
 - `x`: input to the decoder layer of shape (dim, seq_len_dec, batch_size)
 """
 function (layer::DecoderLayer)(x)
+    # _x = x
     _x = layer.attn1(x, x) # self-attention, x is the query, key and value. output shape: (dim_v, seq_len_dec, batch_size)
- 
-    L = size(x, 2)
-    incremental = !haskey(ENV, "DISABLE_INCREMENTAL_ATTENTION") || ENV["DISABLE_INCREMENTAL_ATTENTION"] != "true"
-    if incremental && layer.cache === nothing
-        incremental=false
-    end
-    if incremental
-        prev_x, _x_old = layer.cache
-        if size(prev_x, 2) != L - 1 || selectdim(prev_x, 2, 1) != selectdim(x, 2, 1) || selectdim(prev_x, 2, L-1) != selectdim(x, 2, L-1)
-            incremental = false
-        end
-    end
-    if incremental
-        _x_new = selectdim(_x, 2, L:L) |> copy # TODO: do we need to create copies?
-        _x_new = layer.feedforward(_x_new, _x_new)     # feedforward layer. output shape: (dim_ff, 1, batch_size)
-        _x = cat(_x_old, _x_new, dims=2) # shape: (dim_ff, seq_len_dec, batch_size)
-    else
-        _x = layer.feedforward(_x, _x)     # feedforward layer. output shape: (dim_ff, seq_len_dec, batch_size)
-    end
-    layer.cache = copy.((x, _x))
+    _x = layer.feedforward(_x, _x)  # feedforward layer. output shape: (dim_ff, seq_len_dec, batch_size)
     return _x
 end
 
@@ -316,6 +281,7 @@ Decoder for Transformer. It is composed of a stack of decoder layers and the out
 - `dropout`: dropout probability for each sublayer in each decoder layer
 - `σ`: activation function for the feedforward sublayer in each decoder layer (default: `gelu`)
 - `no_encoder`: if `true`, ignore the encoder-decoder attention sublayer in each decoder layer. This is useful when no encoder output is provided.
+- `incremental_inference_mode`: whether to enable incremental caching for causal self attention. This is useful for auto-regressive or incremental decoding for faster/linear inference at each time step. When enabled, only one input should be passed to the model at a time (the previous KVs in each layer are already cached) and you should call `Flux.reset!` to reset the cache to allow a sequence of inputs at once (as usual e.g., in training).
 
 # References
 - [Attention Is All You Need](https://arxiv.org/abs/1706.03762)
@@ -340,8 +306,8 @@ struct Decoder
     layers::Vector{DecoderLayer}
 end
 Flux.@functor Decoder
-function Decoder(dim::Int, dim_k::Int, dim_v::Int, num_heads::Int, dim_ff::Int, num_layers::Int; dropout=0.0, σ=gelu, no_encoder=false)
-    layers = [DecoderLayer(dim, dim_k, dim_v, num_heads, dim_ff; dropout=dropout, σ=σ, no_encoder=no_encoder) for _ in 1:num_layers]
+function Decoder(dim::Int, dim_k::Int, dim_v::Int, num_heads::Int, dim_ff::Int, num_layers::Int; dropout=0.0, σ=gelu, no_encoder=false, incremental_inference_mode=false)
+    layers = [DecoderLayer(dim, dim_k, dim_v, num_heads, dim_ff; dropout=dropout, σ=σ, no_encoder=no_encoder, incremental_inference_mode=incremental_inference_mode) for _ in 1:num_layers]
     return Decoder(layers)
 end
 
@@ -408,13 +374,15 @@ y = spe(x)  # size (512, 10);
 @assert size(y) == (512, 10)
 ```
 """
-struct SinusoidalPositionalEncoder
+mutable struct SinusoidalPositionalEncoder
     pe::AbstractArray{Float32, 2} # of shape (dim, max_seq_len)
+    i::Int
+    incremental_inference_mode::Bool
 end
-Flux.gpu(spe::SinusoidalPositionalEncoder) = SinusoidalPositionalEncoder(gpu(spe.pe))
-Flux.cpu(spe::SinusoidalPositionalEncoder) = SinusoidalPositionalEncoder(cpu(spe.pe))
+Flux.@functor SinusoidalPositionalEncoder
+Flux.params(l::SinusoidalPositionalEncoder) = Flux.params()
 
-function SinusoidalPositionalEncoder(dim::Int, max_seq_length::Int=10000)
+function SinusoidalPositionalEncoder(dim::Int, max_seq_length::Int=10000; incremental_inference_mode=false)
     pe = zeros(Float32, (dim, max_seq_length))
     for pos in 1:max_seq_length
         for i in 1:dim
@@ -424,7 +392,7 @@ function SinusoidalPositionalEncoder(dim::Int, max_seq_length::Int=10000)
             pe[i, pos] = i % 2 == 1 ? sin(θ) : cos(θ)
         end
     end
-    return SinusoidalPositionalEncoder(pe)
+    return SinusoidalPositionalEncoder(pe, 0, incremental_inference_mode)
 end
 
 function Base.show(io::IO, l::SinusoidalPositionalEncoder)
@@ -450,22 +418,36 @@ y = lpe(x);  # size (512, 10)
 @assert length(Flux.params(lpe)) == 1
 ```
 """
-struct LearnedPositionalEncoder
+mutable struct LearnedPositionalEncoder
     pe::AbstractArray{Float32, 2} # of shape (dim, max_seq_len)
+    i::Int
+    incremental_inference_mode::Bool
 end
 Flux.@functor LearnedPositionalEncoder
+Flux.params(l::LearnedPositionalEncoder) = Flux.params(l.pe)
 
-function LearnedPositionalEncoder(dim::Int, max_seq_length::Int=10000, std=0.01f0)
+function LearnedPositionalEncoder(dim::Int, max_seq_length::Int=10000, std=0.01f0; incremental_inference_mode=false)
     pe = Float32(std) * randn(Float32, (dim, max_seq_length))
-    return LearnedPositionalEncoder(pe)
+    return LearnedPositionalEncoder(pe, 0, incremental_inference_mode)
 end
 
 
+function Flux.reset!(l::Union{SinusoidalPositionalEncoder, LearnedPositionalEncoder})
+    if l.incremental_inference_mode
+        l.i = 0
+    end
+    return nothing
+end
+
 function (postional_encoder::Union{SinusoidalPositionalEncoder, LearnedPositionalEncoder})(x)
-    @assert size(x, 1) == size(postional_encoder.pe, 1) "Dimensionality of the positional encoding and input to the positional encoder must be the same. Yours: $(size(x, 1)), expected: $(size(postional_encoder.pe, 1))"
-    @assert size(x, 2) <= size(postional_encoder.pe, 2) "The sequence length of the input to the positional encoder cannot be greater than the maximum sequence length of the positional encoder. Yours: $(size(x, 2)), expected: not more than $(size(postional_encoder.pe, 2))"
-    seq_len = size(x, 2)
-    pe = @view postional_encoder.pe[:, 1:seq_len]
+    if postional_encoder.incremental_inference_mode && postional_encoder.i > 0
+        postional_encoder.i += 1
+        pe = postional_encoder.pe[:, postional_encoder.i:postional_encoder.i]
+    else
+        seq_len = size(x, 2)
+        postional_encoder.i = seq_len
+        pe = @view postional_encoder.pe[:, 1:seq_len]
+    end
     return x .+ pe
 end
 
