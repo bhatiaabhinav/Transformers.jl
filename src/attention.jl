@@ -72,6 +72,8 @@ end
 mutable struct CasualAttentionIncremental
     cache # K, V, output
 end
+Flux.@functor CasualAttentionIncremental
+Flux.params(ca::CasualAttentionIncremental) = Flux.params()
 CasualAttentionIncremental() = CasualAttentionIncremental(nothing)
 function Flux.reset!(ca::CasualAttentionIncremental)
     # @info "Resetting attention cache"
