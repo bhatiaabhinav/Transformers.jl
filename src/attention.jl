@@ -170,7 +170,7 @@ end
 
 
 """
-    MultiHeadAttention(dim_inp::Int, dim_k::Int, dim_v::Int, num_heads::Int, dim_out::Int, masked::Bool)
+    MultiHeadAttention(dim_inp::Int, dim_k::Int, dim_v::Int, num_heads::Int, dim_out::Int)
 
 Multi-head attention for Transformer. It is composed of multiple attention heads. The outputs of the attention heads are concatenated and passed through a linear layer.
 
@@ -180,7 +180,6 @@ Multi-head attention for Transformer. It is composed of multiple attention heads
 - `dim_v`: output dimension of value layer. Usually `dim_v = dim_k = dim_inp / num_heads`
 - `num_heads`: number of attention heads
 - `dim_out`: output dimension of the (final) linear layer. Usually `dim_out = dim_inp`
-- `masked`: whether to causal mask the attention scores in each attention head
 
 
 # Examples
@@ -188,7 +187,7 @@ Multi-head attention for Transformer. It is composed of multiple attention heads
 dim_inp, dim_k, dim_v = 512, 64, 64
 num_heads = 8
 dim_out = 512
-mha = MultiHeadAttention(dim_inp, dim_k, dim_v, num_heads, dim_out, true);
+mha = MultiHeadAttention(dim_inp, dim_k, dim_v, num_heads, dim_out);
 seq_len_q = 10
 seq_len_k = 20
 batch_size = 32
@@ -200,16 +199,22 @@ output = mha(q_input, k_input, v_input); # size (dim_out, seq_len_q, batch_size)
 
 """
 struct MultiHeadAttention
-    heads::Vector{Attention}
+    qh  # a combined linear layer for query and heads
+    kh  # a combined linear layer for key and heads
+    vh  # a combined linear layer for value and heads
     linear
-    masked::Bool
+    dim_k::Int
+    dim_v::Int
+    num_heads::Int
 end
 Flux.@functor MultiHeadAttention
 
-function MultiHeadAttention(dim_inp::Int, dim_k::Int, dim_v::Int, num_heads::Int, dim_out::Int, masked::Bool)
-    heads = [Attention(dim_inp, dim_k, dim_v, masked) for _ in 1:num_heads]
+function MultiHeadAttention(dim_inp::Int, dim_k::Int, dim_v::Int, num_heads::Int, dim_out::Int)
+    qh = Dense(dim_inp, dim_k * num_heads)
+    vh = Dense(dim_inp, dim_v * num_heads)
+    kh = Dense(dim_inp, dim_k * num_heads)
     linear = Dense(dim_v * num_heads, dim_out)
-    return MultiHeadAttention(heads, linear, masked)
+    return MultiHeadAttention(qh, kh, vh, linear, dim_k, dim_v, num_heads)
 end
 
 
@@ -225,11 +230,35 @@ end
 - `output`: output of size `(dim_out, seq_len_q, batch_size)`
 """
 function (mha::MultiHeadAttention)(q_inp, k_inp, v_inp)
-    # Each head outputs a tensor of size (dim_v, seq_len_q, batch_size). Concatenate the outputs of the attention heads along the first dimension to get a tensor of size (dim_v * num_heads, seq_len_q, batch_size).
-    multihead_output = mapreduce(vcat, mha.heads) do head
-        return head(q_inp, k_inp, v_inp) # (dim_v, seq_len_q, batch_size)
-    end # (dim_v * num_heads, seq_len_q, batch_size)
-    return mha.linear(multihead_output) # (dim_out, seq_len_q, batch_size)
+    dim_k, dim_v, num_heads = mha.dim_k, mha.dim_v, mha.num_heads
+    seq_len_q = size(q_inp)[2]
+    seq_len_k = size(k_inp)[2]
+    seq_len_v = size(v_inp)[2]
+    @assert seq_len_k == seq_len_v "Key and value inputs should have the same sequence length"
+    q = mha.qh(q_inp)  # (dim_k * num_heads, seq_len_q, batch_size)
+    k = mha.kh(k_inp)  # (dim_k * num_heads, seq_len_k, batch_size)
+    v = mha.vh(v_inp)  # (dim_v * num_heads, seq_len_k, batch_size)
+    q = reshape(q, (dim_k, num_heads, size(q)[2:end]...))  # (dim_k, num_heads, seq_len_q, batch_size)
+    k = reshape(k, (dim_k, num_heads, size(k)[2:end]...))  # (dim_k, num_heads, seq_len_k, batch_size)
+    v = reshape(v, (dim_v, num_heads, size(v)[2:end]...))  # (dim_v, num_heads, seq_len_k, batch_size)
+    if ndims(q_inp) == 2
+        q = permutedims(q, (1, 3, 2))  # (dim_k, seq_len_q, num_heads)
+        k = permutedims(k, (1, 3, 2))  # (dim_k, seq_len_k, num_heads)
+        v = permutedims(v, (1, 3, 2))  # (dim_v, seq_len_k, num_heads)
+    else
+        q = permutedims(q, (1, 3, 2, 4))  # (dim_k, seq_len_q, num_heads, batch_size)
+        k = permutedims(k, (1, 3, 2, 4))  # (dim_k, seq_len_k, num_heads, batch_size)
+        v = permutedims(v, (1, 3, 2, 4))  # (dim_v, seq_len_k, num_heads, batch_size)
+    end
+    multihead_output = attention(q, k, v, false)  # (dim_v, seq_len_q, num_heads, batch_size)
+    if ndims(q_inp) == 2
+        multihead_output = permutedims(multihead_output, (1, 3, 2))  # (dim_v, num_heads, seq_len_q)
+    else
+        multihead_output = permutedims(multihead_output, (1, 3, 2, 4))  # (dim_v, num_heads, seq_len_q, batch_size)
+    end
+    multihead_output = reshape(multihead_output, (dim_v * num_heads, size(multihead_output)[3:end]...))  # (dim_v * num_heads, seq_len_q, batch_size)
+    out = mha.linear(multihead_output)  # (dim_out, seq_len_q, batch_size)
+    return out
 end
 
 
@@ -288,7 +317,7 @@ end
 
 
 """
-    MultiHeadSelfAttention(dim_inp::Int, dim_k::Int, dim_v::Int, num_heads::Int, dim_out::Int, maksed::Bool)
+    MultiHeadSelfAttention(dim_inp::Int, dim_k::Int, dim_v::Int, num_heads::Int, dim_out::Int, maksed::Bool; incremental_inference_mode=false)
 
 Equivalent to `MultiHeadAttention` but more efficient and expects the query input, key input, and value input to be the same. It is composed of a single linear layer for query, key, value and all heads, and applies self attention for each head in parallel. There is another linear layer as usual to map the output of the attention heads to the desired output dimension.
 

@@ -177,7 +177,7 @@ end
 
 
 """
-    DecoderLayer(dim::Int, dim_k::Int, dim_v::Int, num_heads::Int, dim_ff::Int; dropout=0.0, σ=gelu, no_encoder=false)
+    DecoderLayer(dim::Int, dim_k::Int, dim_v::Int, num_heads::Int, dim_ff::Int; dropout=0.0, σ=gelu, no_encoder=false, incremental_inference_mode=false)
 
 Decoder layer for Transformer. It is composed of a masked multi-head self-attention attention sublayer, a multi-head encoder-decoder attention sublayer that accepts key and value input from the encoder (potentially of different seq_len) while accepting query input from the first sublayer, and a feedforward sublayer. If no encoder output is provided during inference, then the encoder-decoder attention sublayer is ignored. Each sublayer is wrapped with a residual connection, a layer normalization layer and optional dropout. The output of the decoder layer has the same size and sequence length as the output of the previous decoder layer.
 
@@ -223,7 +223,7 @@ function DecoderLayer(dim::Int, dim_k::Int, dim_v::Int, num_heads::Int, dim_ff::
     attn1 = MultiHeadSelfAttention(dim, dim_k, dim_v, num_heads, dim, true; incremental_inference_mode=incremental_inference_mode)
     attn1 = ResidualAndNorm(attn1, dim; dropout=dropout)
     if !no_encoder
-        attn2 = MultiHeadAttention(dim, dim_k, dim_v, num_heads, dim, false)
+        attn2 = MultiHeadAttention(dim, dim_k, dim_v, num_heads, dim)
         attn2 = ResidualAndNorm(attn2, dim; dropout=dropout)
     else
         attn2 = nothing
@@ -243,8 +243,7 @@ end
 function (layer::DecoderLayer)(x, enc_out)
     _x = layer.attn1(x, x) # self-attention, x is the query, key and value. output shape: (dim_v, seq_len_dec, batch_size)
     _x = layer.attn2(_x, _x, enc_out, enc_out) # encoder-decoder attention, _x is the query. enc_out is the key and value. output shape: (dim_v, seq_len_dec, batch_size)
-    _x = layer.feedforward(_x)     # feedforward layer. output shape: (dim_ff, seq_len_dec, batch_size)
-    layer.cache = copy.((x, _x))
+    _x = layer.feedforward(_x, _x)     # feedforward layer. output shape: (dim_ff, seq_len_dec, batch_size)
     return _x
 end
 
