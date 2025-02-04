@@ -27,7 +27,7 @@ struct ResidualAndNorm
     layernorm
     dropout::Union{Dropout, Nothing}
 end
-Flux.@functor ResidualAndNorm
+Flux.@layer ResidualAndNorm
 
 function ResidualAndNorm(sublayer, dim::Int; dropout=0.0)
     layernorm = LayerNorm(dim)
@@ -91,7 +91,7 @@ struct EncoderLayer
     feedforward::ResidualAndNorm
 end
 
-Flux.@functor EncoderLayer
+Flux.@layer EncoderLayer
 
 function EncoderLayer(dim::Int, dim_k::Int, dim_v::Int, num_heads::Int, dim_ff::Int; dropout=0.0, σ=gelu)
     attn = MultiHeadSelfAttention(dim, dim_k, dim_v, num_heads, dim, false)
@@ -146,7 +146,7 @@ enc_out = encoder(src) # size (512, seq_len, batch_size);
 struct Encoder
     layers::Vector{EncoderLayer}
 end
-Flux.@functor Encoder
+Flux.@layer Encoder
 
 function Encoder(dim::Int, dim_k::Int, dim_v::Int, num_heads::Int, dim_ff::Int, num_layers::Int; dropout=0.0, σ=gelu)
     layers = [EncoderLayer(dim, dim_k, dim_v, num_heads, dim_ff; dropout=dropout, σ=σ) for _ in 1:num_layers]
@@ -190,7 +190,7 @@ Decoder layer for Transformer. It is composed of a masked multi-head self-attent
 - `dropout`: dropout probability for each sublayer
 - `σ`: activation function for the feedforward sublayer (default: `gelu`)
 - `no_encoder`: if `true`, ignore the encoder-decoder attention sublayer. This is useful when no encoder output is provided.
-- `incremental_inference_mode`: whether to enable incremental caching for causal self attention. This is useful for auto-regressive or incremental decoding for faster/linear inference at each time step. When enabled, only one input should be passed to the model at a time (the previous KVs are already cached) and you should call `Flux.reset!` to reset the cache to allow a sequence of inputs at once (as usual e.g., in training).
+- `incremental_inference_mode`: whether to enable incremental caching for causal self attention. This is useful for auto-regressive or incremental decoding for faster/linear inference at each time step. When enabled, only one input should be passed to the model at a time (the previous KVs are already cached) and you should call `Transformers.reset_kv_cache!` to reset the cache to allow a sequence of inputs at once (as usual e.g., in training).
 
 # References
 - [Attention Is All You Need](https://arxiv.org/abs/1706.03762)
@@ -216,7 +216,12 @@ mutable struct DecoderLayer
     attn2 # if `no_encoder`, then this is set to nothing
     feedforward
 end
-Flux.@functor DecoderLayer (attn1, attn2, feedforward)
+Flux.@layer DecoderLayer
+reset_kv_cache!(layer::DecoderLayer) = begin
+    mhsa = layer.attn1.sublayer
+    @assert mhsa isa MultiHeadSelfAttention
+    reset_kv_cache!(mhsa)
+end
 
 function DecoderLayer(dim::Int, dim_k::Int, dim_v::Int, num_heads::Int, dim_ff::Int; dropout=0.0, σ=gelu, no_encoder=false, incremental_inference_mode=false)
     # attn1 = nothing
@@ -266,7 +271,7 @@ end
 
 
 """
-    Decoder(dim::Int, dim_k::Int, dim_v::Int, num_heads::Int, dim_ff::Int, num_layers::Int; dropout=0.0, σ=gelu, no_encoder=false)
+    Decoder(dim::Int, dim_k::Int, dim_v::Int, num_heads::Int, dim_ff::Int, num_layers::Int; dropout=0.0, σ=gelu, no_encoder=false, incremental_inference_mode=false)
 
 Decoder for Transformer. It is composed of a stack of decoder layers and the output is the output of the last decoder layer. The input is assumed to be already embedded and positional encoded. The decoder also needs the output of the encoder to perform encoder-decoder attention. If no encoder output is provided during inference, then each decoder layer performs self-attention only and ignores the encoder-decoder attention sublayer.
 
@@ -280,7 +285,7 @@ Decoder for Transformer. It is composed of a stack of decoder layers and the out
 - `dropout`: dropout probability for each sublayer in each decoder layer
 - `σ`: activation function for the feedforward sublayer in each decoder layer (default: `gelu`)
 - `no_encoder`: if `true`, ignore the encoder-decoder attention sublayer in each decoder layer. This is useful when no encoder output is provided.
-- `incremental_inference_mode`: whether to enable incremental caching for causal self attention. This is useful for auto-regressive or incremental decoding for faster/linear inference at each time step. When enabled, only one input should be passed to the model at a time (the previous KVs in each layer are already cached) and you should call `Flux.reset!` to reset the cache to allow a sequence of inputs at once (as usual e.g., in training).
+- `incremental_inference_mode`: whether to enable incremental caching for causal self attention. This is useful for auto-regressive or incremental decoding for faster/linear inference at each time step. When enabled, only one input should be passed to the model at a time (the previous KVs in each layer are already cached) and you should call `Transformers.reset_kv_cache!` to reset the cache to allow a sequence of inputs at once (as usual e.g., in training).
 
 # References
 - [Attention Is All You Need](https://arxiv.org/abs/1706.03762)
@@ -304,7 +309,12 @@ dec_out = decoder_layer(tgt)      # size (512, tgt_seq_len, batch_size)
 struct Decoder
     layers::Vector{DecoderLayer}
 end
-Flux.@functor Decoder
+Flux.@layer Decoder
+function reset_kv_cache!(decoder::Decoder)
+    for layer in decoder.layers
+        reset_kv_cache!(layer)
+    end
+end
 function Decoder(dim::Int, dim_k::Int, dim_v::Int, num_heads::Int, dim_ff::Int, num_layers::Int; dropout=0.0, σ=gelu, no_encoder=false, incremental_inference_mode=false)
     layers = [DecoderLayer(dim, dim_k, dim_v, num_heads, dim_ff; dropout=dropout, σ=σ, no_encoder=no_encoder, incremental_inference_mode=incremental_inference_mode) for _ in 1:num_layers]
     return Decoder(layers)
@@ -354,7 +364,7 @@ end
 
 
 """
-    SinusoidalPositionalEncoder(dim::Int, max_seq_length::Int=10000)
+    SinusoidalPositionalEncoder(dim::Int, max_seq_length::Int=10000; incremental_inference_mode=false)
 
 Sinusoidal positional encoder. This is used to add positional information to the input embedding. The positional encoding is added to the embedding before the input is passed to the encoder or decoder.
 
@@ -364,6 +374,7 @@ Sinusoidal positional encoder. This is used to add positional information to the
 # Arguments
 - `dim`: dimensionality (1st dimension) of the positional encoding. This is the same as the dimensionality of the input to the positional encoder.
 - `max_seq_length`: maximum sequence length that can be processed by the positional encoder (default: 10000)
+- `incremental_inference_mode`: whether inputs will be passed one at a time for incremental inference. This is useful for auto-regressive or incremental decoding for faster/linear inference at each time step. When enabled, only one input should be passed to the model at a time. You should call `Transformers.reset_pe_position!` to reset the positional encoding to allow a sequence of inputs at once (as usual e.g., in training).
 
 # Example
 ```julia
@@ -378,8 +389,7 @@ mutable struct SinusoidalPositionalEncoder
     i::Int
     incremental_inference_mode::Bool
 end
-Flux.@functor SinusoidalPositionalEncoder
-Flux.params(l::SinusoidalPositionalEncoder) = Flux.params()
+Flux.@layer SinusoidalPositionalEncoder trainable=()
 
 function SinusoidalPositionalEncoder(dim::Int, max_seq_length::Int=10000; incremental_inference_mode=false)
     pe = zeros(Float32, (dim, max_seq_length))
@@ -399,7 +409,7 @@ function Base.show(io::IO, l::SinusoidalPositionalEncoder)
 end
 
 """
-    LearnedPositionalEncoder(dim::Int, max_seq_length::Int=10000, std=0.01f0)
+    LearnedPositionalEncoder(dim::Int, max_seq_length::Int=10000, std=0.01f0; incremental_inference_mode=false)
 
 Learned positional encoder. This is used to add positional information to the input embedding. The positional encoding is added to the embedding before the input is passed to the encoder or decoder. In this case, the positional encoding is a learnable parameter, initialized from a normal distribution. 
 
@@ -407,6 +417,7 @@ Learned positional encoder. This is used to add positional information to the in
 - `dim`: dimensionality (1st dimension) of the positional encoding. This is the same as the dimensionality of the input to the positional encoder.
 - `max_seq_length`: maximum sequence length that can be processed by the positional encoder (default: 10000)
 - `std`: standard deviation of the normal distribution used to initialize the positional encoding (default: 0.01f0)
+- `incremental_inference_mode`: whether inputs will be passed one at a time for incremental inference. This is useful for auto-regressive or incremental decoding for faster/linear inference at each time step. When enabled, only one input should be passed to the model at a time. You should call `Transformers.reset_pe_position!` to reset the positional encoding to allow a sequence of inputs at once (as usual e.g., in training).
 
 # Example
 ```julia
@@ -422,8 +433,8 @@ mutable struct LearnedPositionalEncoder
     i::Int
     incremental_inference_mode::Bool
 end
-Flux.@functor LearnedPositionalEncoder
-Flux.params(l::LearnedPositionalEncoder) = Flux.params(l.pe)
+Flux.@layer LearnedPositionalEncoder
+
 
 function LearnedPositionalEncoder(dim::Int, max_seq_length::Int=10000, std=0.01f0; incremental_inference_mode=false)
     pe = Float32(std) * randn(Float32, (dim, max_seq_length))
@@ -431,7 +442,7 @@ function LearnedPositionalEncoder(dim::Int, max_seq_length::Int=10000, std=0.01f
 end
 
 
-function Flux.reset!(l::Union{SinusoidalPositionalEncoder, LearnedPositionalEncoder})
+function reset_pe_position!(l::Union{SinusoidalPositionalEncoder, LearnedPositionalEncoder})
     if l.incremental_inference_mode
         l.i = 0
     end

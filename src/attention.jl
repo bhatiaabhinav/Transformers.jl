@@ -3,9 +3,11 @@ using CUDA
 using LinearAlgebra
 using DataStructures
 
-function mybatchedtranspose(x)
-    batch_dims = size(x)[3:end]
+function _transpose(x::AbstractArray{T, N})::AbstractArray{T, N} where {T, N}
     return permutedims(x, (2, 1, (1:ndims(x))[3:end]...))
+end
+function _transpose(x::AbstractVecOrMat{T})::AbstractVecOrMat{T} where {T}
+    return x'
 end
 
 cached_masks = Dict{Any, Any}()
@@ -35,14 +37,14 @@ Attention(Q, K, V) = softmax(\\frac{QK^T}{\\sqrt{d_k}})V
 ```
 
 where `Q`, `K`, and `V` are query, key, and value, respectively. `d_k` is the dimension of `K` and `Q`.
-In this implementation, `Q`, `K`, and `V` are batched matrices. The first dimension is the dimension of each vector, and the second dimension is the sequence length. After that, there can be any number of dimensions, which are treated as batch dimensions. Batch dimensions are optional.
+In this implementation, `Q`, `K`, and `V` are batched matrices. The first dimension is the dimension of each vector, and the second dimension is the sequence length, and the third dimension onwards are batch dimensions.
 
-Accordingly, `Q`, `K`, and `V` are of size `(d_k, seq_len_q, batch_size...)`, `(d_k, seq_len_k, batch_size...)`, and `(d_v, seq_len_k, batch_size...)`, respectively. The output is of size `(d_v, seq_len_q, batch_size...)`. Internally, the matrices are mutliplied in order opposite to the math notation. i.e., it is V * softmax(K^T * Q / sqrt(d_k)) since the original formula assumes row vectors instead of column vectors.
+Accordingly, `Q`, `K`, and `V` are of size `(d_k, seq_len_q, batch_size...)`, `(d_k, seq_len_k, batch_size...)`, and `(d_v, seq_len_k, batch_size...)`, respectively. The output is of size `(d_v, seq_len_q, batch_size...)`. Internally, the matrices are mutliplied in order opposite to the math notation. i.e., it is V * softmax(Kᵀ * Q / sqrt(d_k)) since the original formula in the paper assumed row vectors instead of column vectors. (Column vectors are more efficient in Julia and also respect mathematical conventions).
 
 # Arguments
-- `Q`: query of size `(d_k, seq_len_q, batch_size...)`
-- `K`: key of size `(d_k, seq_len_k, batch_size...)`
-- `V`: value of size `(d_v, seq_len_k, batch_size...)
+- `Q`: query of size `(d_k, seq_len_q, batch_size)`
+- `K`: key of size `(d_k, seq_len_k, batch_size)`
+- `V`: value of size `(d_v, seq_len_k, batch_size)
 - `masked`: whether to causal mask the attention scores
 
 # References
@@ -52,34 +54,28 @@ function attention(Q, K, V, masked)
     d_k, seq_len_q = size(Q)[1:2]
     d_v, seq_len_k = size(V)[1:2]
     device = Q isa CUDA.CuArray ? gpu : cpu
-    mask =  masked && seq_len_q > 1 ? get_mask((seq_len_k, seq_len_q), device) : 0
-    if length(size(Q)) > 2 # batched
-        scores = mybatchedtranspose(K) ⊠ Q / Float32(sqrt(d_k)) # (seq_len_k, seq_len_q, batch_size...)
+    scores = _transpose(K) ⊠ Q / Float32(sqrt(d_k))        # (seq_len_k, seq_len_q, batch_size)
+    if masked
+        @assert seq_len_q == seq_len_k "Masked attention requires the query and key sequences to be of the same length"
+        mask = get_mask((seq_len_k, seq_len_q), device)
         scores = scores .+ mask
-        attn = softmax(scores, dims=1) # (seq_len_k, seq_len_q, batch_size...)
-        # Flux.Zygote.@ignore push!(attn_hisory, cpu(attn))
-        ret_val = V ⊠ attn # (d_v, seq_len_q, batch_size...)
-    else # non-batched. Can be implemented more efficiently by using standard matrix multiplication.
-        scores = K' * Q / Float32(sqrt(d_k)) # (seq_len_k, seq_len_q)
-        scores = scores .+ mask
-        attn = softmax(scores, dims=1) # (seq_len_k, seq_len_q)
-        # Flux.Zygote.@ignore push!(attn_hisory, cpu(attn))
-        ret_val = V * attn # (d_v, seq_len_q)
     end
+    attn = softmax(scores, dims=1)              # (seq_len_k, seq_len_q, batch_size)
+    ret_val = V ⊠ attn                          # (d_v, seq_len_q, batch_size...)
     return ret_val
 end
 
-mutable struct CasualAttentionIncremental
+
+mutable struct CasualAttentionWithKVCaching
     cache # K, V, output
 end
-Flux.@functor CasualAttentionIncremental
-Flux.params(ca::CasualAttentionIncremental) = Flux.params()
-CasualAttentionIncremental() = CasualAttentionIncremental(nothing)
-function Flux.reset!(ca::CasualAttentionIncremental)
-    # @info "Resetting attention cache"
+Flux.@layer :ignore CasualAttentionWithKVCaching trainable=()
+Base.show(::IO, ::CasualAttentionWithKVCaching) = print("CasualAttentionIncremental()")
+CasualAttentionWithKVCaching() = CasualAttentionWithKVCaching(nothing)
+function reset_kv_cache!(ca::CasualAttentionWithKVCaching)
     free_cache_memory!(ca)
 end
-function free_cache_memory!(cai::CasualAttentionIncremental)
+function free_cache_memory!(cai::CasualAttentionWithKVCaching)
     if !isnothing(cai.cache)
         K, V = cai.cache
         Flux.Zygote.@ignore if isa(K, CUDA.CuArray); CUDA.unsafe_free!(K); end
@@ -88,7 +84,7 @@ function free_cache_memory!(cai::CasualAttentionIncremental)
     end
 end
 
-function (cai::CasualAttentionIncremental)(Q_new, K_new, V_new, masked)
+function (cai::CasualAttentionWithKVCaching)(Q_new, K_new, V_new, masked)
     @assert masked "Incremental attention caching is supported only for causal (masked) attention"
     if isnothing(cai.cache)
         Q, K, V = Q_new, K_new, V_new  # assuming that the first call is not incremental and these can be full length
@@ -96,12 +92,12 @@ function (cai::CasualAttentionIncremental)(Q_new, K_new, V_new, masked)
         cai.cache = Flux.Zygote.@ignore (K, V)
         return ret
     else
-        @assert size(Q_new)[2] == 1 "Only one query at a time is allowed for incremental attention. Call Flux.reset! to reset the cache to allow a sequence of queries."
+        @assert size(Q_new)[2] == 1 "Only one query at a time is allowed for incremental attention. Call Transformers.reset_kv_cache! to reset the cache to allow a sequence of queries."
         K = Flux.Zygote.@ignore cat(cai.cache[1], K_new, dims=2)
         V = Flux.Zygote.@ignore cat(cai.cache[2], V_new, dims=2)
         free_cache_memory!(cai)
         cai.cache = Flux.Zygote.@ignore (K, V)
-        return attention(Q_new, K, V, true)
+        return attention(Q_new, K, V, false)
     end
 end
 
@@ -139,7 +135,7 @@ struct Attention
     v_layer::Dense
     masked::Bool
 end
-Flux.@functor Attention
+Flux.@layer Attention
 
 function Attention(dim_inp::Int, dim_k::Int, dim_v::Int, masked::Bool)
     q_layer = Dense(dim_inp, dim_k)
@@ -207,7 +203,7 @@ struct MultiHeadAttention
     dim_v::Int
     num_heads::Int
 end
-Flux.@functor MultiHeadAttention
+Flux.@layer MultiHeadAttention
 
 function MultiHeadAttention(dim_inp::Int, dim_k::Int, dim_v::Int, num_heads::Int, dim_out::Int)
     qh = Dense(dim_inp, dim_k * num_heads)
@@ -294,7 +290,7 @@ struct SelfAttention
     dim_v::Int
     masked::Bool
 end
-Flux.@functor SelfAttention (qkv,)
+Flux.@layer SelfAttention trainable=(qkv,)
 
 function SelfAttention(dim_inp::Int, dim_k::Int, dim_v::Int, masked::Bool)
     qkv = Dense(dim_inp, dim_k * 2 + dim_v)
@@ -353,16 +349,16 @@ mutable struct MultiHeadSelfAttention
     attn_fn
 end
 
-Flux.@functor MultiHeadSelfAttention (qkvh, linear)
-function Flux.reset!(mhsa::MultiHeadSelfAttention)
-    isa(mhsa.attn_fn, CasualAttentionIncremental) ? Flux.reset!(mhsa.attn_fn) : nothing
+Flux.@layer MultiHeadSelfAttention trainable=(qkvh, linear)
+function reset_kv_cache!(mhsa::MultiHeadSelfAttention)
+    isa(mhsa.attn_fn, CasualAttentionWithKVCaching) ? reset_kv_cache!(mhsa.attn_fn) : nothing
     return nothing
 end
 
 function MultiHeadSelfAttention(dim_inp::Int, dim_k::Int, dim_v::Int, num_heads::Int, dim_out::Int, masked::Bool; incremental_inference_mode=false)
     qkvh = Dense(dim_inp, (dim_k * 2 + dim_v) * num_heads)
     linear = Dense(dim_v * num_heads, dim_out)
-    attn_fn = incremental_inference_mode ? CasualAttentionIncremental() : attention
+    attn_fn = incremental_inference_mode ? CasualAttentionWithKVCaching() : attention
     return MultiHeadSelfAttention(qkvh, linear, dim_k, dim_v, num_heads, masked, attn_fn)
 end
 
